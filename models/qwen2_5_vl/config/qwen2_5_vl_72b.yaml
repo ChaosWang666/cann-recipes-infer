@@ -1,0 +1,21 @@
+model_name: "qwen2.5-vl"
+model_path: "/data/models/origin/Qwen2.5-VL-72B-Instruct"
+exe_mode: "eager"        # ["ge_graph", "eager", "acl_graph"]
+world_size: 16
+
+model_config:
+  enable_profiler: True# [False, True]
+  with_ckpt: True # [False, True]
+  enable_cache_compile: True# [False, True]
+  enable_online_split_weight: True # [False, True]
+
+data_config:
+  dataset: "vision-arena-bench-v0.1"
+  input_max_len: 4080
+  max_new_tokens: 256
+  batch_size: 1
+
+parallel_config:
+  attn_tp_size: 8
+  embed_tp_size: 8
+  lmhead_tp_size: 8

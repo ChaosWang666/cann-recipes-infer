@@ -11,6 +11,7 @@ import json
 import os
 import logging
 from datasets import load_dataset  # requires version == 3.6.0
+from typing import Any, Dict, List, Optional
 
 
 def load_infinitebench_dataset(data_path):
@@ -36,6 +37,121 @@ def load_longbench_dataset(data_path):
         for d in data:
             prompts.append(d['context'])
     return prompts
+
+
+def _normalize_vision_prompt(entry: Dict[str, Any], image_root: Optional[str] = None) -> Dict[str, Any]:
+    if "messages" in entry:
+        messages = entry["messages"]
+    elif "conversations" in entry:
+        messages = entry["conversations"]
+    else:
+        question = entry.get("question") or entry.get("prompt") or entry.get("text") or ""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": question,
+                    }
+                ],
+            }
+        ]
+    images_field = entry.get("images") or entry.get("image") or []
+    if isinstance(images_field, (str, os.PathLike)):
+        image_candidates = [images_field]
+    elif isinstance(images_field, dict):
+        image_candidates = list(images_field.values())
+    elif isinstance(images_field, list):
+        image_candidates = []
+        for item in images_field:
+            if isinstance(item, dict):
+                candidate = (
+                    item.get("path")
+                    or item.get("image")
+                    or item.get("value")
+                    or item.get("url")
+                    or item.get("file")
+                )
+                if candidate:
+                    image_candidates.append(candidate)
+            else:
+                image_candidates.append(item)
+    else:
+        image_candidates = []
+
+    normalized_images: List[str] = []
+    for candidate in image_candidates:
+        if candidate is None:
+            continue
+        if isinstance(candidate, (str, os.PathLike)):
+            image_path = os.fspath(candidate)
+        else:
+            image_path = str(candidate)
+        if image_root and not os.path.isabs(image_path):
+            image_path = os.path.join(image_root, image_path)
+        normalized_images.append(image_path)
+    return {"messages": messages, "images": normalized_images}
+
+
+def load_vision_arena_bench(dataset_path: str) -> List[Dict[str, Any]]:
+    bench_dirs = [
+        os.path.abspath(os.path.join(dataset_path, "vision_arena_bench")),
+        os.path.abspath(os.path.join(dataset_path, "vision-arena-bench-v0.1")),
+    ]
+
+    def _load_jsonl(jsonl_path: str, image_root: str) -> List[Dict[str, Any]]:
+        prompts: List[Dict[str, Any]] = []
+        with open(jsonl_path, "r", encoding="utf-8") as file:
+            for line in file:
+                if line.strip():
+                    prompts.append(_normalize_vision_prompt(json.loads(line), image_root))
+        return prompts
+
+    def _load_json(json_path: str, image_root: str) -> List[Dict[str, Any]]:
+        with open(json_path, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+        if isinstance(payload, list):
+            entries = payload
+        elif isinstance(payload, dict):
+            for key in ("data", "instances", "samples", "records"):
+                if isinstance(payload.get(key), list):
+                    entries = payload[key]
+                    break
+            else:
+                entries = [payload]
+        else:
+            raise ValueError(f"Unsupported data format in {json_path}")
+        return [_normalize_vision_prompt(entry, image_root) for entry in entries]
+
+    for bench_dir in bench_dirs:
+        if not os.path.isdir(bench_dir):
+            continue
+
+        candidates = [
+            os.path.join(bench_dir, "dataset.jsonl"),
+            os.path.join(bench_dir, "vision_arena_bench.jsonl"),
+            os.path.join(bench_dir, "dataset.json"),
+            os.path.join(bench_dir, "vision_arena_bench.json"),
+        ]
+        prompts: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                if candidate.endswith(".jsonl"):
+                    prompts = _load_jsonl(candidate, bench_dir)
+                else:
+                    prompts = _load_json(candidate, bench_dir)
+                break
+
+        if not prompts:
+            # Continue searching alternate directories if no valid file found.
+            continue
+        return prompts
+
+    raise FileNotFoundError(
+        "vision_arena_bench dataset not found. Please place the dataset under"
+        " `dataset/vision_arena_bench` or update the dataset path in the runner configuration."
+    )
 
 
 def generate_default_prompt(dataset_dir):
@@ -93,8 +209,13 @@ def generate_prompt(runner_settings):
         if os.path.isdir(dataset_path): # use local InfiniteBench dataset first
             dataset = dataset_path
         preset_prompts = load_infinitebench_dataset(dataset)
+    elif dataset == "vision-arena-bench-v0.1":
+        preset_prompts = load_vision_arena_bench(dataset_path)
     else:
-        raise Exception(f"your dataset {dataset} is not supported, dataset supported: LongBench, InfiniteBench")
+        raise Exception(
+            f"your dataset {dataset} is not supported, dataset supported: LongBench, InfiniteBench, "
+            "vision-arena-bench-v0.1"
+        )
     return get_prompts_for_cur_rank(preset_prompts, batch_size, batch_size_per_rank, global_dp_rank)
 
 
