@@ -84,10 +84,25 @@ def _normalize_vision_prompt(entry: Dict[str, Any], image_root: Optional[str] = 
     for candidate in image_candidates:
         if candidate is None:
             continue
+
+        image_path: Optional[str] = None
         if isinstance(candidate, (str, os.PathLike)):
             image_path = os.fspath(candidate)
+        elif hasattr(candidate, "filename") and getattr(candidate, "filename"):
+            image_path = os.fspath(getattr(candidate, "filename"))
+        elif hasattr(candidate, "path") and getattr(candidate, "path"):
+            image_path = os.fspath(getattr(candidate, "path"))
+        elif isinstance(candidate, dict):
+            for key in ("path", "image", "value", "url", "file"):
+                value = candidate.get(key)
+                if value:
+                    image_path = os.fspath(value)
+                    break
         else:
             image_path = str(candidate)
+
+        if not image_path:
+            continue
         if image_root and not os.path.isabs(image_path):
             image_path = os.path.join(image_root, image_path)
         normalized_images.append(image_path)
@@ -95,10 +110,14 @@ def _normalize_vision_prompt(entry: Dict[str, Any], image_root: Optional[str] = 
 
 
 def load_vision_arena_bench(dataset_path: str) -> List[Dict[str, Any]]:
-    bench_dirs = [
-        os.path.abspath(os.path.join(dataset_path, "vision_arena_bench")),
-        os.path.abspath(os.path.join(dataset_path, "vision-arena-bench-v0.1")),
-    ]
+    abs_dataset_path = os.path.abspath(dataset_path)
+    bench_dirs = []
+    for candidate in (
+        abs_dataset_path,
+        os.path.join(abs_dataset_path, "vision-arena-bench-v0.1"),
+    ):
+        if candidate not in bench_dirs:
+            bench_dirs.append(candidate)
 
     def _load_jsonl(jsonl_path: str, image_root: str) -> List[Dict[str, Any]]:
         prompts: List[Dict[str, Any]] = []
@@ -124,12 +143,15 @@ def load_vision_arena_bench(dataset_path: str) -> List[Dict[str, Any]]:
             raise ValueError(f"Unsupported data format in {json_path}")
         return [_normalize_vision_prompt(entry, image_root) for entry in entries]
 
+    def _load_parquet_files(parquet_files: List[str], image_root: Optional[str]) -> List[Dict[str, Any]]:
+        dataset = load_dataset("parquet", data_files={"train": parquet_files}, split="train")
+        return [_normalize_vision_prompt(entry, image_root) for entry in dataset]
+
     for bench_dir in bench_dirs:
         if not os.path.isdir(bench_dir):
             continue
 
         candidates = [
-            os.path.join(bench_dir, "dataset.jsonl"),
             os.path.join(bench_dir, "vision_arena_bench.jsonl"),
             os.path.join(bench_dir, "dataset.json"),
             os.path.join(bench_dir, "vision_arena_bench.json"),
@@ -144,13 +166,20 @@ def load_vision_arena_bench(dataset_path: str) -> List[Dict[str, Any]]:
                 break
 
         if not prompts:
-            # Continue searching alternate directories if no valid file found.
-            continue
-        return prompts
+            parquet_files: List[str] = []
+            for root_dir, _, files in os.walk(bench_dir):
+                for filename in files:
+                    if filename.lower().endswith(".parquet"):
+                        parquet_files.append(os.path.join(root_dir, filename))
+            if parquet_files:
+                parquet_files.sort()
+                prompts = _load_parquet_files(parquet_files, bench_dir)
+
+        if prompts:
+            return prompts
 
     raise FileNotFoundError(
-        "vision_arena_bench dataset not found. Please place the dataset under"
-        " `dataset/vision_arena_bench` or update the dataset path in the runner configuration."
+        "vision_arena_bench dataset not found or empty. Please verify the local dataset path."
     )
 
 
