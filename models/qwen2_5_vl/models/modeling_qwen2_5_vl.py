@@ -2117,3 +2117,25 @@ class Qwen2_5_VLForCausalLM(Qwen2_5_VLForConditionalGeneration):
         prefix: str = "",
     ):
         super().__init__(config, runner_settings=runner_settings, prefix=prefix)
+
+    def prefill(self, **kwargs):
+        """Run the prefill stage of generation.
+
+        The runner expects the model to expose dedicated ``prefill`` and
+        ``decode`` entry points, mirroring the interface provided by the MoE
+        based recipes.  The reference implementation of Qwen2.5-VL only
+        implements ``forward``, so we delegate to it here to keep backwards
+        compatibility with the shared runner logic.
+        """
+
+        return self.forward(**kwargs)
+
+    def decode(self, **kwargs):
+        """Run the decode stage of generation.
+
+        Similar to :meth:`prefill`, this is a thin wrapper around
+        :meth:`forward` so that the generic runner can compile and invoke a
+        ``decode`` method when graph mode is enabled.
+        """
+
+        return self.forward(**kwargs)
