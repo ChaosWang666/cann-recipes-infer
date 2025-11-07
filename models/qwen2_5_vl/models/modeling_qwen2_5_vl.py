@@ -205,7 +205,7 @@ def build_vocab_parallel_embedding(
     return _set_weight_loader(embedding)
 
 
-logger = logging.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class Qwen2_5_VLMLP(nn.Module):
