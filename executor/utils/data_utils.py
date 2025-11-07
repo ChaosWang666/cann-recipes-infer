@@ -11,7 +11,12 @@ import json
 import os
 import logging
 from datasets import load_dataset  # requires version == 3.6.0
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
+
+try:
+    from PIL import Image as PILImage
+except ImportError:  # pragma: no cover - PIL is available in deployment images
+    PILImage = None
 
 
 def load_infinitebench_dataset(data_path):
@@ -58,54 +63,45 @@ def _normalize_vision_prompt(entry: Dict[str, Any], image_root: Optional[str] = 
             }
         ]
     images_field = entry.get("images") or entry.get("image") or []
-    if isinstance(images_field, (str, os.PathLike)):
-        image_candidates = [images_field]
-    elif isinstance(images_field, dict):
-        image_candidates = list(images_field.values())
-    elif isinstance(images_field, list):
-        image_candidates = []
-        for item in images_field:
-            if isinstance(item, dict):
-                candidate = (
-                    item.get("path")
-                    or item.get("image")
-                    or item.get("value")
-                    or item.get("url")
-                    or item.get("file")
-                )
-                if candidate:
-                    image_candidates.append(candidate)
-            else:
-                image_candidates.append(item)
-    else:
-        image_candidates = []
 
-    normalized_images: List[str] = []
-    for candidate in image_candidates:
-        if candidate is None:
-            continue
+    def _collect_image_references(value: Any) -> List[Any]:
+        if value is None:
+            return []
 
-        image_path: Optional[str] = None
-        if isinstance(candidate, (str, os.PathLike)):
-            image_path = os.fspath(candidate)
-        elif hasattr(candidate, "filename") and getattr(candidate, "filename"):
-            image_path = os.fspath(getattr(candidate, "filename"))
-        elif hasattr(candidate, "path") and getattr(candidate, "path"):
-            image_path = os.fspath(getattr(candidate, "path"))
-        elif isinstance(candidate, dict):
-            for key in ("path", "image", "value", "url", "file"):
-                value = candidate.get(key)
-                if value:
-                    image_path = os.fspath(value)
-                    break
-        else:
-            image_path = str(candidate)
+        # Already a PIL image instance – return directly.
+        if PILImage is not None and isinstance(value, PILImage.Image):
+            return [value]
 
-        if not image_path:
-            continue
-        if image_root and not os.path.isabs(image_path):
-            image_path = os.path.join(image_root, image_path)
-        normalized_images.append(image_path)
+        if isinstance(value, (str, os.PathLike)):
+            image_path = os.fspath(value)
+            if image_root and not os.path.isabs(image_path):
+                image_path = os.path.join(image_root, image_path)
+            return [image_path]
+
+        if hasattr(value, "filename") and getattr(value, "filename"):
+            return _collect_image_references(getattr(value, "filename"))
+        if hasattr(value, "path") and getattr(value, "path"):
+            return _collect_image_references(getattr(value, "path"))
+
+        if isinstance(value, dict):
+            collected: List[Any] = []
+            for key in ("path", "image", "value", "url", "file", "bytes", "data"):
+                if key in value:
+                    collected.extend(_collect_image_references(value[key]))
+            if collected:
+                return collected
+            return []
+
+        if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
+            collected: List[Any] = []
+            for item in value:
+                collected.extend(_collect_image_references(item))
+            return collected
+
+        # Fallback: keep original object (e.g. NumPy arrays, raw bytes).
+        return [value]
+
+    normalized_images: List[Any] = _collect_image_references(images_field)
     return {"messages": messages, "images": normalized_images}
 
 
