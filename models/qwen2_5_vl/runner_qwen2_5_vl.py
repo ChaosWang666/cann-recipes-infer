@@ -88,18 +88,8 @@ class Qwen2_5_VLRunner(ModelRunner):
         self.processor = None
 
     def init_model(self):
-        config = Qwen2_5_VLConfig.from_pretrained(self.model_path, trust_remote_code=True)
-        self.hf_config = config
-        self.model = Qwen2_5_VLForCausalLM.from_pretrained(
-            self.model_path,
-            config=config,
-            torch_dtype=self.dtype,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
-            runner_settings=self.runner_settings,
-        ).to(self.device)
+        super().init_model(Qwen2_5_VLForCausalLM, Qwen2_5_VLConfig)
         self.model.eval()
-        self.compile_model()
         self.init_processor()
 
     def init_processor(self):
