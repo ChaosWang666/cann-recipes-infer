@@ -2,6 +2,7 @@
 """Configuration definitions for the Qwen2.5-VL Ascend recipe."""
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict, List, Optional, Union
 
 from transformers.configuration_utils import PretrainedConfig
@@ -64,9 +65,13 @@ class Qwen2_5_VLTextConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
+        self.rope_scaling = copy.deepcopy(rope_scaling)
         if self.rope_scaling is not None:
-            rope_config_validation(self)
+            if "type" in self.rope_scaling:
+                if self.rope_scaling["type"] == "mrope":
+                    self.rope_scaling["type"] = "default"
+                self.rope_scaling.setdefault("rope_type", self.rope_scaling["type"])
+            rope_config_validation(self, ignore_keys={"mrope_section"})
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.use_sliding_window = use_sliding_window
@@ -149,8 +154,11 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         eos_token_id: int = 151645,
         projection_dim: int = 8192,
         max_position_embeddings: Optional[int] = None,
+        rope_scaling: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
+        extra_rope_scaling = kwargs.pop("rope_scaling", None)
+        rope_scaling = rope_scaling or extra_rope_scaling
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -163,9 +171,13 @@ class Qwen2_5_VLConfig(PretrainedConfig):
 
         if isinstance(text_config, dict) or text_config is None:
             text_config = text_config or {}
+            if rope_scaling is not None and "rope_scaling" not in text_config:
+                text_config["rope_scaling"] = copy.deepcopy(rope_scaling)
             self.text_config = Qwen2_5_VLTextConfig(**text_config)
         elif isinstance(text_config, Qwen2_5_VLTextConfig):
             self.text_config = text_config
+            if rope_scaling is not None and self.text_config.rope_scaling is None:
+                self.text_config.rope_scaling = copy.deepcopy(rope_scaling)
         else:
             raise TypeError("text_config must be a dict or Qwen2_5_VLTextConfig instance")
 
@@ -195,6 +207,7 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.layer_types = self.text_config.layer_types
+        self.rope_scaling = self.text_config.rope_scaling
 
         if self.text_config.pad_token_id != pad_token_id:
             logger.warning(
