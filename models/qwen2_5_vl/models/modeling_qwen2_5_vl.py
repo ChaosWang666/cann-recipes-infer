@@ -519,7 +519,11 @@ class Qwen2_5_VLVisionAttention(nn.Module):
                 )[0]
                 for q, k, v in zip(*splits)
             ]
-            attn_output = torch.cat(attn_outputs, dim=1)
+            # Each chunk keeps the same `(batch, num_heads, chunk_seq, head_dim)` layout, so we
+            # need to stitch them back together along the sequence dimension (dim=2). Concatenating
+            # along the head dimension (dim=1) would incorrectly inflate the number of heads and
+            # break the final reshape back to `[seq_len, hidden_size]`.
+            attn_output = torch.cat(attn_outputs, dim=2)
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.proj(attn_output)
@@ -826,7 +830,9 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    mrope_section = mrope_section * 2
+    if isinstance(mrope_section, torch.Tensor):
+        mrope_section = mrope_section.tolist()
+    mrope_section = [int(section) for section in mrope_section] * 2
     cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(
         unsqueeze_dim
     )
@@ -939,8 +945,9 @@ class Qwen2_5_VLAttention(nn.Module):
         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
         cos, sin = position_embeddings
+        mrope_section = self.rope_scaling["mrope_section"]
         query_states, key_states = apply_multimodal_rotary_pos_emb(
-            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+            query_states, key_states, cos, sin, mrope_section
         )
 
         if past_key_value is not None:
@@ -1080,9 +1087,24 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         prefix: str = "",
     ):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
         self.parallel_context = parallel_context or Qwen2_5_VLParallelContext()
+
+        embed_tp_size = max(1, self.parallel_context.embed_tp_size)
+        local_vocab_size = (config.vocab_size + embed_tp_size - 1) // embed_tp_size
+        tp_rank = self.parallel_context.tp_rank("embed_tp_group")
+        local_start_index = tp_rank * local_vocab_size
+        local_end_index = min(local_start_index + local_vocab_size, config.vocab_size)
+
+        pad_token_id = config.pad_token_id
+        if (
+            pad_token_id is not None
+            and pad_token_id >= 0
+            and local_start_index <= pad_token_id < local_end_index
+        ):
+            self.padding_idx = pad_token_id - local_start_index
+        else:
+            self.padding_idx = None
+        self.vocab_size = config.vocab_size
 
         dtype = getattr(config, "torch_dtype", torch.bfloat16)
         self.embed_tokens = build_vocab_parallel_embedding(
@@ -1111,6 +1133,12 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
 
     @auto_docstring
     def forward(
@@ -1151,6 +1179,15 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+            pad_token_id = self.config.pad_token_id
+            if (
+                pad_token_id is not None
+                and pad_token_id >= 0
+                and (self.padding_idx is None or pad_token_id != self.padding_idx)
+            ):
+                pad_mask = input_ids.eq(pad_token_id)
+                if pad_mask.any():
+                    inputs_embeds = inputs_embeds.masked_fill(pad_mask.unsqueeze(-1), 0)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -1192,8 +1229,13 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
                 "position_ids": text_position_ids,
             }
             # Create the masks
+            full_attention_mask = create_causal_mask(**mask_kwargs)
             causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
+                "full_attention": full_attention_mask,
+                # The config historically used "attention" while the mask helper
+                # was keyed as "full_attention". Expose both names so older
+                # checkpoints keep working without KeyError.
+                "attention": full_attention_mask,
             }
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:

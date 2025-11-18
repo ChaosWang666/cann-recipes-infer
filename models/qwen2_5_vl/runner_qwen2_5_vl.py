@@ -35,6 +35,71 @@ def _format_text_content(text: str) -> List[Dict[str, Any]]:
     return [{"type": "text", "text": text}]
 
 
+def _count_image_placeholders(messages: List[Dict[str, Any]]) -> int:
+    count = 0
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "image":
+                count += 1
+    return count
+
+
+def _prepend_image_placeholders(messages: List[Dict[str, Any]], missing: int) -> None:
+    if missing <= 0 or not messages:
+        return
+
+    target_message = None
+    for message in messages:
+        if message.get("role", "user") == "user":
+            target_message = message
+            break
+    if target_message is None:
+        target_message = messages[0]
+
+    content = target_message.get("content")
+    if not isinstance(content, list):
+        content = _format_text_content(str(content))
+
+    placeholders = [{"type": "image"} for _ in range(missing)]
+    target_message["content"] = placeholders + content
+
+
+def _trim_image_placeholders(messages: List[Dict[str, Any]], excess: int) -> None:
+    if excess <= 0:
+        return
+
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        new_content: List[Dict[str, Any]] = []
+        for item in content:
+            if excess > 0 and isinstance(item, dict) and item.get("type") == "image":
+                excess -= 1
+                continue
+            new_content.append(item)
+        message["content"] = new_content
+        if excess == 0:
+            break
+
+
+def _align_image_placeholders(messages: List[Dict[str, Any]], expected_images: int) -> None:
+    current = _count_image_placeholders(messages)
+    if current < expected_images:
+        _prepend_image_placeholders(messages, expected_images - current)
+        logging.debug(
+            "Inserted %s image placeholder(s) to match %s loaded images.", expected_images - current, expected_images
+        )
+    elif current > expected_images:
+        _trim_image_placeholders(messages, current - expected_images)
+        logging.debug(
+            "Trimmed %s image placeholder(s) after loading only %s images.", current - expected_images, expected_images
+        )
+
+
 def _ensure_conversation(prompt: Any) -> Tuple[List[Dict[str, Any]], List[Any]]:
     """Convert the prompt to Qwen2.5-VL chat format."""
     if isinstance(prompt, dict) and "messages" in prompt:
@@ -120,8 +185,23 @@ class Qwen2_5_VLRunner(ModelRunner):
         images_batch = []
         for prompt in prompts:
             conversation, images = _ensure_conversation(prompt)
+            loaded_images = []
+            dropped_images = 0
+            for item in images:
+                image_obj = _load_image(item)
+                if image_obj is None:
+                    dropped_images += 1
+                    continue
+                loaded_images.append(image_obj)
+            if dropped_images:
+                logging.warning(
+                    "Dropped %s image(s) that could not be loaded; aligning placeholders with the remaining %s.",
+                    dropped_images,
+                    len(loaded_images),
+                )
+            _align_image_placeholders(conversation, len(loaded_images))
             conversations.append(conversation)
-            images_batch.append([img for img in ([_load_image(item) for item in images]) if img is not None])
+            images_batch.append(loaded_images)
         text_batch = [
             self.processor.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
             for conv in conversations
@@ -160,12 +240,20 @@ class Qwen2_5_VLRunner(ModelRunner):
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask")
         pixel_values = inputs.get("pixel_values")
+        pixel_values_videos = inputs.get("pixel_values_videos")
         pixel_attention_mask = inputs.get("pixel_attention_mask")
+        image_grid_thw = inputs.get("image_grid_thw")
+        video_grid_thw = inputs.get("video_grid_thw")
+        second_per_grid_ts = inputs.get("second_per_grid_ts")
 
         prefill_inputs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "pixel_values": pixel_values,
+            "pixel_values_videos": pixel_values_videos,
+            "image_grid_thw": image_grid_thw,
+            "video_grid_thw": video_grid_thw,
+            "second_per_grid_ts": second_per_grid_ts,
             "pixel_attention_mask": pixel_attention_mask,
             "use_cache": True,
         }
@@ -188,10 +276,23 @@ class Qwen2_5_VLRunner(ModelRunner):
                 next_tokens,
                 past_key_values=past_key_values,
                 attention_mask=current_attention_mask,
-                use_cache=True
+                use_cache=True,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
             )
             if pixel_values is not None and "pixel_values" not in model_inputs:
                 model_inputs["pixel_values"] = pixel_values
+            if pixel_values_videos is not None and "pixel_values_videos" not in model_inputs:
+                model_inputs["pixel_values_videos"] = pixel_values_videos
+            if image_grid_thw is not None and "image_grid_thw" not in model_inputs:
+                model_inputs["image_grid_thw"] = image_grid_thw
+            if video_grid_thw is not None and "video_grid_thw" not in model_inputs:
+                model_inputs["video_grid_thw"] = video_grid_thw
+            if second_per_grid_ts is not None and "second_per_grid_ts" not in model_inputs:
+                model_inputs["second_per_grid_ts"] = second_per_grid_ts
             if pixel_attention_mask is not None and "pixel_attention_mask" not in model_inputs:
                 model_inputs["pixel_attention_mask"] = pixel_attention_mask
             model_inputs = {k: v for k, v in model_inputs.items() if v is not None}
